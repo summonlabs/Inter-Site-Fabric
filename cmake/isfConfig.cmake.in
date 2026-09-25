@@ -1,0 +1,19 @@
+@PACKAGE_INIT@
+
+# Inter-Site Fabric CMake package.
+#
+# Consume with:
+#   find_package(isf CONFIG REQUIRED)
+#   target_link_libraries(my_target PRIVATE isf::daemon)
+
+include(CMakeFindDependencyMacro)
+
+if(WIN32)
+  find_package(Threads REQUIRED)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/isfTargets.cmake")
+
+check_required_components(isf)
+
+set(isf_VERSION "@PROJECT_VERSION@")

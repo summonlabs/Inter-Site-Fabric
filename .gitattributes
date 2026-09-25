@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Summon Software Labs.
+#
+# Normalise line endings in the repository so that every clone, on every
+# platform, checks out the same bytes.
+
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.lib binary
+*.exe binary
+*.dll binary

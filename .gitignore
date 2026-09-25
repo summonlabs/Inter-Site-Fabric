@@ -1,0 +1,44 @@
+# Build trees
+/build/
+/build-*/
+/out/
+/install/
+/prefix/
+/_fresh/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+*.cmake.user
+compile_commands.json
+
+# Visual Studio / MSVC
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.lib
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Runtime scratch produced by tests and tooling
+*.isfstate/
+*.isfstore
+*.log
+*.tmp
+/scratch/
+/tmp/
+/.isf/
+/tests/scratch/
+/tests/tmp/
