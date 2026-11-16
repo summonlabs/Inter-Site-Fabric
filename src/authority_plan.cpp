@@ -89,6 +89,19 @@ MutationResult Authority::plan_bump_epoch(Epoch epoch, PrincipalId principal, Ar
     updated.reason = bounded(reason);
     mutation.changes.push_back(change_for(updated, false));
   }
+  // A grant that was only proposed, or found eligible, is bound to the
+  // superseded epoch as well. It holds nothing that could be withdrawn, and
+  // left as it is it could never advance again, so it is refused.
+  for (const auto& entry : grants_) {
+    const GrantRecord& grant = entry.second;
+    if (grant.state != GrantState::Proposed && grant.state != GrantState::Eligible) {
+      continue;
+    }
+    GrantRecord updated = grant;
+    updated.state = GrantState::Refused;
+    updated.reason = bounded(reason);
+    mutation.changes.push_back(change_for(updated, false));
+  }
   mutation.summary = "bump epoch to " + epoch.to_string() + " by " +
                      (principal.is_nil() ? std::string("<anonymous>") : principal.to_string());
   return mutation;
@@ -213,9 +226,49 @@ void Authority::rebalance_path(std::vector<StateChange>& out, const PathRecord& 
         touched = true;
       }
     }
+    // A policy that requires independent verification for an active grant takes
+    // effect for the grants that are already active: one that was activated
+    // without verification is degraded, which keeps its capacity.
+    if (rebind_policy && policy.require_verification_for_active &&
+        updated.state == GrantState::Active && updated.verification != VerificationState::Verified &&
+        !updated.historical && updated.provenance == Provenance::Live) {
+      updated.state = GrantState::Degraded;
+      touched = true;
+    }
     if (touched) {
       updated.updated_at_ms = now_ms;
       updated.reason = bounded(reason);
+      out.push_back(change_for(updated, false));
+    }
+  }
+
+  // A grant that was proposed, or found eligible, holds no capacity, so there
+  // is nothing to withdraw: it follows the path to the generations it will be
+  // reserved under. Left bound to the superseded ones it could never advance
+  // again, and the invariant check refuses a live grant with a stale binding.
+  for (const auto& entry : grants_) {
+    const GrantRecord& grant = entry.second;
+    if (!(grant.binding.path == path.id) ||
+        (grant.state != GrantState::Proposed && grant.state != GrantState::Eligible)) {
+      continue;
+    }
+    GrantRecord updated = grant;
+    bool touched = false;
+    if (rebind_policy && !(updated.binding.policy_generation == policy.generation)) {
+      updated.binding.policy_generation = policy.generation;
+      touched = true;
+    }
+    if (rebind_path_capacity) {
+      if (!(updated.binding.path_generation == path.generation)) {
+        updated.binding.path_generation = path.generation;
+        touched = true;
+      }
+      if (!(updated.binding.capacity_generation == path.capacity_generation)) {
+        updated.binding.capacity_generation = path.capacity_generation;
+        touched = true;
+      }
+    }
+    if (touched) {
       out.push_back(change_for(updated, false));
     }
   }
@@ -307,6 +360,20 @@ MutationResult Authority::plan_register_site(const SiteRegistration& registratio
     updated.historical = true;
     updated.provenance = Provenance::FencedIncarnation;
     updated.verification = VerificationState::Unverified;
+    mutation.changes.push_back(change_for(updated, false));
+  }
+  // What the superseded incarnation proposed but never reserved is refused: it
+  // holds nothing, and the fenced incarnation can not advance it.
+  for (const auto& entry : grants_) {
+    const GrantRecord& grant = entry.second;
+    if (!(grant.binding.holder == descriptor.id) ||
+        (grant.state != GrantState::Proposed && grant.state != GrantState::Eligible)) {
+      continue;
+    }
+    GrantRecord updated = grant;
+    updated.state = GrantState::Refused;
+    updated.reason = bounded(reason);
+    updated.updated_at_ms = registration.now_ms;
     mutation.changes.push_back(change_for(updated, false));
   }
 
@@ -1074,6 +1141,12 @@ MutationResult Authority::plan_verify_grant(const GrantVerification& verificatio
   updated.updated_at_ms = verification.now_ms;
   if (verification.result == VerificationState::Failed) {
     updated.reason = bounded("independent verification failed");
+  }
+  // Where the policy requires verification for an active grant, an active grant
+  // whose verification is no longer positive is degraded. It keeps its capacity.
+  if (config_.policy.require_verification_for_active && updated.state == GrantState::Active &&
+      verification.result != VerificationState::Verified) {
+    updated.state = GrantState::Degraded;
   }
   mutation.changes.push_back(change_for(updated, false));
   mutation.summary = "verify grant " + grant.id.to_string() + " result " +

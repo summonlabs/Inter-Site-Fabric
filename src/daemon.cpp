@@ -6,7 +6,9 @@
 #include "isf/clock.hpp"
 #include "isf/log.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -342,7 +344,29 @@ Status Daemon::maybe_compact(std::uint64_t now) {
   (void)estimate;
   {
     std::lock_guard<std::mutex> guard(state_mutex_);
+    // Records that no longer affect any decision are dropped here, where the
+    // durable image is rewritten anyway. Ended grants are kept as history for as
+    // long as the snapshot stays well inside one record and below the
+    // compaction threshold; past that the oldest go first. Without this the
+    // state only grows, the snapshot stops fitting its record, the log can no
+    // longer be compacted, and once it is full no mutation can be recorded.
+    const std::size_t budget =
+        std::min(options_.store.max_record_bytes, options_.store.compact_threshold_bytes / 2);
+    (void)authority_.discard_history(std::numeric_limits<std::size_t>::max());
     snapshot = authority_.snapshot();
+    while (encode_snapshot_body(snapshot).size() > budget) {
+      std::size_t ended = 0;
+      for (const auto& grant : snapshot.grants) {
+        if (is_terminal(grant.state)) {
+          ++ended;
+        }
+      }
+      if (ended == 0) {
+        break;
+      }
+      (void)authority_.discard_history(ended / 2);
+      snapshot = authority_.snapshot();
+    }
   }
   std::lock_guard<std::mutex> guard(store_mutex_);
   const Status status = store_.compact(snapshot, now, options_.incarnation);

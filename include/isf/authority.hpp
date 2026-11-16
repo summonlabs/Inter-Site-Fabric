@@ -295,8 +295,19 @@ class Authority {
                                       const std::string& reason);
 
   /// Mark every non-terminal grant whose binding does not match the current
-  /// incarnation as historical. Called once at start-up.
+  /// incarnation as historical. Called once at start-up. A grant that was
+  /// proposed or found eligible and is still bound to superseded state is
+  /// refused here: it holds no capacity and can never advance again.
   [[nodiscard]] Status mark_all_historical();
+
+  /// Discard records that can no longer affect any decision: capacity
+  /// attestations that a later one superseded, oversubscription authorities
+  /// bound to a superseded epoch or generation, and, oldest first and beyond
+  /// `retain_ended_grants`, grants that have ended, together with their
+  /// verification records. Nothing live is touched. Returns the number of
+  /// records discarded. Without this the state only ever grows, and with it
+  /// the snapshot that has to fit one bounded log record.
+  std::size_t discard_history(std::size_t retain_ended_grants);
 
  private:
   [[nodiscard]] Expected<GrantRecord> require_grant(GrantId id) const;

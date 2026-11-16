@@ -1509,3 +1509,414 @@ ISF_TEST(net, endpoint_parsing_is_strict) {
   ISF_REQUIRE(!Endpoint::parse("host:99999").ok());
   ISF_REQUIRE(!Endpoint::parse("").ok());
 }
+
+// ---------------------------------------------------------------------------
+// Grants that were proposed but never reserved, across a dependency change
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Proposes a grant for site A of the fixture and applies the plan.
+GrantOperation propose_for_a(Authority& authority, const FabricFixture& fixture, std::uint64_t request,
+                             std::uint64_t arbitration) {
+  GrantProposal proposal;
+  proposal.request = RequestId::from_seed(9, request);
+  proposal.holder = fixture.a;
+  proposal.holder_incarnation = fixture.a_incarnation;
+  proposal.holder_generation = fixture.a_generation;
+  proposal.path = fixture.path;
+  proposal.amount = 100;
+  proposal.duration_ms = 60000;
+  proposal.now_ms = 2000;
+  auto planned = authority.plan_propose_grant(proposal, ArbSeq{arbitration});
+  ISF_REQUIRE_OK(planned);
+  ISF_REQUIRE_EQ(authority.apply(planned.value().changes, ArbSeq{arbitration}), Status::Ok);
+  GrantOperation op;
+  op.grant = GrantId::from_raw(planned.value().changes.front().key);
+  op.actor = fixture.a;
+  op.actor_incarnation = fixture.a_incarnation;
+  op.epoch = authority.epoch();
+  op.now_ms = 2000;
+  return op;
+}
+
+}  // namespace
+
+ISF_TEST(authority, a_dependency_change_leaves_no_unreserved_grant_bound_to_the_past) {
+  // A grant that was proposed, or found eligible, holds no capacity yet. A change of capacity,
+  // path, policy, site incarnation, or epoch must leave the authority consistent all the same.
+  const char* const kinds[] = {"capacity", "path", "policy", "incarnation", "epoch"};
+  for (const char* kind : kinds) {
+    const std::string what(kind);
+    AuthorityConfig config;
+    Authority authority(config);
+    auto fixture = setup_fabric(authority, "dependency-" + what, 1000, 1000);
+    ISF_REQUIRE_OK(fixture);
+    const GrantOperation proposed = propose_for_a(authority, fixture.value(), 1, 10);
+    const GrantOperation eligible = propose_for_a(authority, fixture.value(), 2, 11);
+    auto evaluated = authority.plan_evaluate_grant(eligible, ArbSeq{12});
+    ISF_REQUIRE_OK(evaluated);
+    ISF_REQUIRE_EQ(authority.apply(evaluated.value().changes, ArbSeq{12}), Status::Ok);
+    ISF_REQUIRE(authority.find_grant(eligible.grant)->state == GrantState::Eligible);
+    ISF_REQUIRE_EQ(authority.verify_invariants(nullptr), Status::Ok);
+
+    MutationResult change = Status::Unsupported;
+    if (what == "capacity") {
+      CapacityAttestation attestation;
+      attestation.id = AttestationId::from_seed(77, 1);
+      attestation.path = fixture.value().path;
+      attestation.path_generation = fixture.value().path_generation;
+      attestation.capacity_generation = Generation{2};
+      attestation.usable = 900;
+      attestation.advertised = 900;
+      attestation.observed = 900;
+      attestation.issuer = authority.incarnation();
+      attestation.epoch = authority.epoch();
+      attestation.principal = principal_from_name("operator");
+      attestation.observed_at_ms = 3000;
+      attestation.evidence = Digest256::of(ByteSpan(reinterpret_cast<const Byte*>(what.data()), what.size()));
+      attestation.source = "test";
+      change = authority.plan_attest_capacity(attestation, ArbSeq{20});
+    } else if (what == "path") {
+      PathRegistration registration;
+      registration.descriptor.id = fixture.value().path;
+      registration.descriptor.name = "dependency-path";
+      registration.descriptor.endpoint_a = fixture.value().a;
+      registration.descriptor.endpoint_b = fixture.value().b;
+      registration.path_generation = Generation{2};
+      registration.state = PathState::Up;
+      registration.advertised = 1000;
+      registration.now_ms = 3000;
+      change = authority.plan_register_path(registration, ArbSeq{20});
+    } else if (what == "policy") {
+      Policy policy = authority.policy();
+      policy.generation = Generation{2};
+      change = authority.plan_install_policy(policy, principal_from_name("operator"), ArbSeq{20});
+    } else if (what == "incarnation") {
+      SiteRegistration registration;
+      registration.descriptor.id = fixture.value().a;
+      registration.descriptor.name = "dependency-a";
+      registration.incarnation = Incarnation::from_seed(0xF00D, 2);
+      registration.epoch = authority.epoch();
+      registration.now_ms = 3000;
+      change = authority.plan_register_site(registration, ArbSeq{20});
+    } else {
+      change = authority.plan_bump_epoch(Epoch{2}, principal_from_name("operator"), ArbSeq{20});
+    }
+    ISF_REQUIRE_OK(change);
+    ISF_REQUIRE_EQ(authority.apply(change.value().changes, ArbSeq{20}), Status::Ok);
+    std::string why;
+    if (authority.verify_invariants(&why) != Status::Ok) {
+      ISF_FAIL("after a change of " + what + ": " + why);
+    }
+    if (what == "incarnation" || what == "epoch") {
+      // What the superseded incarnation or epoch proposed is refused.
+      ISF_REQUIRE(authority.find_grant(proposed.grant)->state == GrantState::Refused);
+      ISF_REQUIRE(authority.find_grant(eligible.grant)->state == GrantState::Refused);
+    } else {
+      // The grants follow the path to its new generations and can still advance.
+      ISF_REQUIRE(authority.find_grant(proposed.grant)->state == GrantState::Proposed);
+      ISF_REQUIRE(authority.find_grant(eligible.grant)->state == GrantState::Eligible);
+      ISF_REQUIRE_OK(authority.plan_evaluate_grant(proposed, ArbSeq{21}));
+      ISF_REQUIRE_OK(authority.plan_reserve_grant(eligible, ArbSeq{22}));
+    }
+  }
+}
+
+namespace {
+
+/// Takes a grant for site A of the fixture through proposal, evaluation, reservation and, when
+/// asked, verification and activation. Arbitration sequences start at `arbitration`.
+GrantOperation hold_for_a(Authority& authority, const FabricFixture& fixture, std::uint64_t request,
+                          std::uint64_t arbitration, Amount amount, GrantClass klass, bool verify,
+                          bool activate) {
+  GrantProposal proposal;
+  proposal.request = RequestId::from_seed(11, request);
+  proposal.holder = fixture.a;
+  proposal.holder_incarnation = fixture.a_incarnation;
+  proposal.holder_generation = fixture.a_generation;
+  proposal.path = fixture.path;
+  proposal.amount = amount;
+  proposal.grant_class = klass;
+  proposal.duration_ms = 60000;
+  proposal.now_ms = 2000;
+  auto planned = authority.plan_propose_grant(proposal, ArbSeq{arbitration});
+  ISF_REQUIRE_OK(planned);
+  ISF_REQUIRE_EQ(authority.apply(planned.value().changes, ArbSeq{arbitration}), Status::Ok);
+  GrantOperation op;
+  op.grant = GrantId::from_raw(planned.value().changes.front().key);
+  op.actor = fixture.a;
+  op.actor_incarnation = fixture.a_incarnation;
+  op.epoch = authority.epoch();
+  op.now_ms = 2000;
+  auto evaluated = authority.plan_evaluate_grant(op, ArbSeq{arbitration + 1});
+  ISF_REQUIRE_OK(evaluated);
+  ISF_REQUIRE_EQ(authority.apply(evaluated.value().changes, ArbSeq{arbitration + 1}), Status::Ok);
+  auto reserved = authority.plan_reserve_grant(op, ArbSeq{arbitration + 2});
+  ISF_REQUIRE_OK(reserved);
+  ISF_REQUIRE_EQ(authority.apply(reserved.value().changes, ArbSeq{arbitration + 2}), Status::Ok);
+  if (verify) {
+    GrantVerification verification;
+    verification.id = VerificationId::from_seed(12, request);
+    verification.grant = op.grant;
+    verification.verifier = principal_from_name("verifier");
+    verification.result = VerificationState::Verified;
+    verification.now_ms = 2000;
+    auto verified = authority.plan_verify_grant(verification, ArbSeq{arbitration + 3});
+    ISF_REQUIRE_OK(verified);
+    ISF_REQUIRE_EQ(authority.apply(verified.value().changes, ArbSeq{arbitration + 3}), Status::Ok);
+  }
+  if (activate) {
+    auto activated = authority.plan_activate_grant(op, ArbSeq{arbitration + 4});
+    ISF_REQUIRE_OK(activated);
+    ISF_REQUIRE_EQ(authority.apply(activated.value().changes, ArbSeq{arbitration + 4}), Status::Ok);
+  }
+  return op;
+}
+
+}  // namespace
+
+ISF_TEST(authority, withdrawing_a_protected_grant_to_fit_the_floor_keeps_the_authority_consistent) {
+  // When the protected floor shrinks below what is held, the authority withdraws protected grants
+  // until the rest fits. A withdrawing grant still holds its capacity until it is retired; that
+  // is the remedy at work, not a protected obligation above the floor.
+  const char* const kinds[] = {"capacity", "path-down", "policy"};
+  for (const char* kind : kinds) {
+    const std::string what(kind);
+    AuthorityConfig config;
+    Authority authority(config);
+    auto fixture = setup_fabric(authority, "floor-" + what, 1000, 1000);
+    ISF_REQUIRE_OK(fixture);
+    // The default floor is 10% of 1000 = 100, and the grant takes all of it.
+    const GrantOperation op =
+        hold_for_a(authority, fixture.value(), 1, 10, 100, GrantClass::Protected, false, true);
+    ISF_REQUIRE_EQ(authority.verify_invariants(nullptr), Status::Ok);
+
+    MutationResult change = Status::Unsupported;
+    if (what == "capacity") {
+      CapacityAttestation attestation;
+      attestation.id = AttestationId::from_seed(78, 1);
+      attestation.path = fixture.value().path;
+      attestation.path_generation = fixture.value().path_generation;
+      attestation.capacity_generation = Generation{2};
+      attestation.usable = 500;  // the floor falls to 50
+      attestation.advertised = 500;
+      attestation.observed = 500;
+      attestation.issuer = authority.incarnation();
+      attestation.epoch = authority.epoch();
+      attestation.principal = principal_from_name("operator");
+      attestation.observed_at_ms = 3000;
+      attestation.evidence = Digest256::of(ByteSpan(reinterpret_cast<const Byte*>(what.data()), what.size()));
+      attestation.source = "test";
+      change = authority.plan_attest_capacity(attestation, ArbSeq{20});
+    } else if (what == "path-down") {
+      change = authority.plan_set_path_state(fixture.value().path, PathState::Down, "link lost", 3000, ArbSeq{20});
+    } else {
+      Policy policy = authority.policy();
+      policy.generation = Generation{2};
+      policy.protected_floor_bps = 500;  // the floor falls to 50
+      change = authority.plan_install_policy(policy, principal_from_name("operator"), ArbSeq{20});
+    }
+    ISF_REQUIRE_OK(change);
+    ISF_REQUIRE_EQ(authority.apply(change.value().changes, ArbSeq{20}), Status::Ok);
+    ISF_REQUIRE(authority.find_grant(op.grant)->state == GrantState::Withdrawing);
+    std::string why;
+    if (authority.verify_invariants(&why) != Status::Ok) {
+      ISF_FAIL("after " + what + ": " + why);
+    }
+    // The capacity is still held until the grant is retired.
+    ISF_REQUIRE_EQ(authority.ledger(fixture.value().path).value().withdrawing, Amount{100});
+  }
+}
+
+ISF_TEST(authority, a_recovered_active_grant_is_consistent_under_a_policy_that_requires_verification) {
+  // Recovered evidence is historical: a restart resets the verification of every live grant. A
+  // policy that requires verification for activation must not turn that into an inconsistency.
+  AuthorityConfig config;
+  config.policy.require_verification_for_active = true;
+  Authority authority(config);
+  auto fixture = setup_fabric(authority, "verified-recovery", 1000, 1000);
+  ISF_REQUIRE_OK(fixture);
+  const GrantOperation op =
+      hold_for_a(authority, fixture.value(), 1, 10, 100, GrantClass::General, true, true);
+  ISF_REQUIRE(authority.find_grant(op.grant)->state == GrantState::Active);
+  ISF_REQUIRE_EQ(authority.verify_invariants(nullptr), Status::Ok);
+
+  auto recovered = Authority::from_snapshot(config, authority.snapshot());
+  ISF_REQUIRE_OK(recovered);
+  ISF_REQUIRE(recovered.value().find_grant(op.grant)->historical);
+  ISF_REQUIRE(recovered.value().find_grant(op.grant)->verification == VerificationState::Unverified);
+  std::string why;
+  if (recovered.value().verify_invariants(&why) != Status::Ok) {
+    ISF_FAIL("recovered state: " + why);
+  }
+  // The capacity is still held after recovery.
+  auto ledger = recovered.value().ledger(fixture.value().path);
+  ISF_REQUIRE_OK(ledger);
+  ISF_REQUIRE_EQ(ledger.value().committed, Amount{100});
+}
+
+ISF_TEST(authority, a_policy_that_requires_verification_degrades_what_is_active_without_it) {
+  AuthorityConfig config;
+  Authority authority(config);
+  auto fixture = setup_fabric(authority, "verification-policy", 1000, 1000);
+  ISF_REQUIRE_OK(fixture);
+  // Activated without verification, which the policy in force permits.
+  const GrantOperation unverified =
+      hold_for_a(authority, fixture.value(), 1, 10, 100, GrantClass::General, false, true);
+  const GrantOperation verified =
+      hold_for_a(authority, fixture.value(), 2, 20, 100, GrantClass::General, true, true);
+
+  Policy stricter = authority.policy();
+  stricter.generation = Generation{2};
+  stricter.require_verification_for_active = true;
+  auto installed = authority.plan_install_policy(stricter, principal_from_name("operator"), ArbSeq{30});
+  ISF_REQUIRE_OK(installed);
+  ISF_REQUIRE_EQ(authority.apply(installed.value().changes, ArbSeq{30}), Status::Ok);
+  std::string why;
+  if (authority.verify_invariants(&why) != Status::Ok) {
+    ISF_FAIL("after the policy was installed: " + why);
+  }
+  ISF_REQUIRE(authority.find_grant(unverified.grant)->state == GrantState::Degraded);
+  ISF_REQUIRE(authority.find_grant(verified.grant)->state == GrantState::Active);
+  ISF_REQUIRE_EQ(authority.ledger(fixture.value().path).value().committed, Amount{200});
+
+  // A verification that fails for an active grant degrades it under that policy.
+  GrantVerification failed;
+  failed.id = VerificationId::from_seed(13, 1);
+  failed.grant = verified.grant;
+  failed.verifier = principal_from_name("verifier");
+  failed.result = VerificationState::Failed;
+  failed.now_ms = 4000;
+  auto reported = authority.plan_verify_grant(failed, ArbSeq{31});
+  ISF_REQUIRE_OK(reported);
+  ISF_REQUIRE_EQ(authority.apply(reported.value().changes, ArbSeq{31}), Status::Ok);
+  if (authority.verify_invariants(&why) != Status::Ok) {
+    ISF_FAIL("after a failed verification: " + why);
+  }
+  ISF_REQUIRE(authority.find_grant(verified.grant)->state == GrantState::Degraded);
+  ISF_REQUIRE_EQ(authority.ledger(fixture.value().path).value().committed, Amount{200});
+}
+
+// ---------------------------------------------------------------------------
+// Daemon
+// ---------------------------------------------------------------------------
+
+ISF_TEST(daemon, a_capacity_change_with_a_proposal_outstanding_does_not_stop_the_daemon) {
+  ScratchDir scratch("unit-proposal-attest");
+  const std::string state = scratch.file("state.isfstore");
+  {
+    auto fabric = LocalFabric::start(state);
+    ISF_REQUIRE_OK(fabric);
+    auto client = fabric.value()->client();
+    ISF_REQUIRE_OK(client);
+    auto fixture = setup_fabric(client.value(), "proposal-attest", 1000);
+    ISF_REQUIRE_OK(fixture);
+
+    GrantProposal proposal;
+    proposal.request = RequestId::random();
+    proposal.holder = fixture.value().a;
+    proposal.holder_incarnation = fixture.value().a_incarnation;
+    proposal.holder_generation = fixture.value().a_generation;
+    proposal.path = fixture.value().path;
+    proposal.amount = 100;
+    proposal.duration_ms = 600000;
+    proposal.now_ms = isf::now_ms();
+    auto proposed = client.value().propose_grant(proposal);
+    ISF_REQUIRE_OK(proposed);
+    auto grant = extract_grant(proposed.value());
+    ISF_REQUIRE_OK(grant);
+
+    // The path's capacity is attested again while the proposal is still waiting.
+    CapacityAttestation attestation;
+    attestation.id = AttestationId::random();
+    attestation.path = fixture.value().path;
+    attestation.path_generation = fixture.value().path_generation;
+    attestation.capacity_generation = Generation{2};
+    attestation.usable = 900;
+    attestation.advertised = 900;
+    attestation.observed = 900;
+    attestation.issuer = client.value().hello().server_incarnation;
+    attestation.epoch = client.value().hello().epoch;
+    attestation.principal = principal_from_name("operator");
+    attestation.observed_at_ms = isf::now_ms();
+    const std::string tag = "proposal-attest";
+    attestation.evidence = Digest256::of(ByteSpan(reinterpret_cast<const Byte*>(tag.data()), tag.size()));
+    attestation.source = "test";
+    ISF_REQUIRE_OK(client.value().attest_capacity(attestation));
+
+    // The daemon goes on taking mutations, and the proposal goes on to a reservation.
+    GrantOperation op;
+    op.grant = grant.value().id;
+    op.actor = fixture.value().a;
+    op.actor_incarnation = fixture.value().a_incarnation;
+    op.epoch = client.value().hello().epoch;
+    op.lease = grant.value().binding.lease;
+    op.now_ms = isf::now_ms();
+    ISF_REQUIRE_OK(client.value().evaluate_grant(op));
+    ISF_REQUIRE_OK(client.value().reserve_grant(op));
+    fabric.value()->stop();
+  }
+  // And it starts again from what it wrote.
+  auto again = LocalFabric::start(state);
+  ISF_REQUIRE_OK(again);
+  auto client = again.value()->client();
+  ISF_REQUIRE_OK(client);
+  auto status = client.value().status();
+  ISF_REQUIRE_OK(status);
+  ISF_REQUIRE_EQ(status.value().grants, std::size_t{1});
+}
+
+ISF_TEST(daemon, ended_grants_do_not_outgrow_the_snapshot) {
+  // Every grant stays in authoritative state after it has ended. The snapshot that compaction
+  // writes has to fit one bounded record, so that history has to give way before it does not.
+  ScratchDir scratch("unit-history");
+  const std::string state = scratch.file("state.isfstore");
+  LocalFabric::Options options;
+  options.store.max_record_bytes = 64U << 10;
+  options.store.max_log_bytes = 512U << 10;
+  options.store.compact_threshold_bytes = 64U << 10;
+  options.store.compact_threshold_records = 128;
+  options.store.durable_writes = false;
+  {
+    auto fabric = LocalFabric::start(state, options);
+    ISF_REQUIRE_OK(fabric);
+    auto client = fabric.value()->client();
+    ISF_REQUIRE_OK(client);
+    auto fixture = setup_fabric(client.value(), "history", 1000);
+    ISF_REQUIRE_OK(fixture);
+    for (int cycle = 0; cycle < 1500; ++cycle) {
+      GrantProposal proposal;
+      proposal.request = RequestId::random();
+      proposal.holder = fixture.value().a;
+      proposal.holder_incarnation = fixture.value().a_incarnation;
+      proposal.holder_generation = fixture.value().a_generation;
+      proposal.path = fixture.value().path;
+      proposal.amount = 10;
+      proposal.duration_ms = 600000;
+      proposal.now_ms = isf::now_ms();
+      auto proposed = client.value().propose_grant(proposal);
+      if (!proposed.ok()) {
+        ISF_FAIL("proposal " + std::to_string(cycle) + " failed: " + proposed.outcome().to_string());
+      }
+      auto grant = extract_grant(proposed.value());
+      ISF_REQUIRE_OK(grant);
+      GrantOperation op;
+      op.grant = grant.value().id;
+      op.actor = fixture.value().a;
+      op.actor_incarnation = fixture.value().a_incarnation;
+      op.epoch = client.value().hello().epoch;
+      op.now_ms = isf::now_ms();
+      auto cancelled = client.value().cancel_grant(op);
+      if (!cancelled.ok()) {
+        ISF_FAIL("cancellation " + std::to_string(cycle) + " failed: " + cancelled.outcome().to_string());
+      }
+    }
+    auto status = client.value().status();
+    ISF_REQUIRE_OK(status);
+    ISF_REQUIRE(status.value().store_bytes <= options.store.max_log_bytes);
+    fabric.value()->stop();
+  }
+  auto again = LocalFabric::start(state, options);
+  ISF_REQUIRE_OK(again);
+}

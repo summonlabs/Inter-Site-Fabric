@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace isf {
 namespace {
@@ -821,10 +822,19 @@ Status Authority::verify_invariants(std::string* explanation) const {
   // One pass over the grant table builds every path's totals, so verifying the
   // whole authority stays linear in the number of records.
   std::map<Id128, PathTotals> totals_by_path;
+  // Protected capacity that is still an obligation. A protected grant that is
+  // being withdrawn holds its capacity until it is retired, but it is no longer
+  // an obligation: withdrawing it is how the authority brings the obligations
+  // back under a floor that shrank.
+  std::map<Id128, Amount> protected_obligations;
   for (const auto& entry : grants_) {
     const GrantRecord& grant = entry.second;
     if (!holds_capacity(grant.state)) {
       continue;
+    }
+    if (grant.grant_class == GrantClass::Protected && grant.state != GrantState::Withdrawing) {
+      Amount& obligations = protected_obligations[grant.binding.path.raw()];
+      obligations = saturating_add(obligations, grant.amount);
     }
     PathTotals& totals = totals_by_path[grant.binding.path.raw()];
     if (grant.state == GrantState::Active || grant.state == GrantState::Degraded) {
@@ -907,7 +917,8 @@ Status Authority::verify_invariants(std::string* explanation) const {
                       std::to_string(computed.oversubscribed) + " units without authority");
     }
     // Protected obligations are never oversubscribed, under any circumstances.
-    if (totals.protected_held > record_floor) {
+    const auto obligations = protected_obligations.find(record.id.raw());
+    if (obligations != protected_obligations.end() && obligations->second > record_floor) {
       return fail(Status::Conflicting,
                   "path " + record.id.to_string() +
                       " has protected obligations above the policy protected floor");
@@ -971,8 +982,13 @@ Status Authority::verify_invariants(std::string* explanation) const {
         return fail(Status::Stale, "live grant bound to a superseded capacity generation");
       }
     }
+    // The rule is about a grant that was activated under the policy. A recovered
+    // or reconciled grant is historical evidence by design: its verification is
+    // reset on every restart, and it stays active, flagged, until it is verified
+    // again.
     if (grant.state == GrantState::Active && config_.policy.require_verification_for_active &&
-        grant.verification != VerificationState::Verified) {
+        grant.verification != VerificationState::Verified && !grant.historical &&
+        grant.provenance == Provenance::Live) {
       return fail(Status::Incomplete, "active grant has no independent verification");
     }
   }
@@ -1220,8 +1236,108 @@ Status Authority::mark_all_historical() {
       continue;
     }
     record.historical = true;
+    if (record.state != GrantState::Proposed && record.state != GrantState::Eligible) {
+      continue;
+    }
+    // A grant that never reserved anything and is bound to superseded state can
+    // not advance, and the invariant check refuses a live grant with a stale
+    // binding. It is refused, which is terminal and frees nothing.
+    const auto site_it = sites_.find(record.binding.holder.raw());
+    const auto path_it = paths_.find(record.binding.path.raw());
+    const bool current =
+        site_it != sites_.end() && path_it != paths_.end() &&
+        record.binding.epoch.value == config_.epoch.value &&
+        record.binding.holder_incarnation == site_it->second.incarnation &&
+        record.binding.policy_generation == config_.policy.generation &&
+        record.binding.path_generation == path_it->second.generation &&
+        record.binding.capacity_generation == path_it->second.capacity_generation;
+    if (!current) {
+      record.state = GrantState::Refused;
+      record.reason = bounded("bound to superseded state when the authority restarted");
+    }
   }
   return Status::Ok;
+}
+
+std::size_t Authority::discard_history(std::size_t retain_ended_grants) {
+  std::size_t discarded = 0;
+
+  // Only the attestation that established a path's current capacity generation
+  // is evidence for anything; every earlier one was superseded by it.
+  for (auto it = attestations_.begin(); it != attestations_.end();) {
+    const auto path_it = paths_.find(it->second.path.raw());
+    if (path_it == paths_.end() ||
+        !(it->second.capacity_generation == path_it->second.capacity_generation)) {
+      it = attestations_.erase(it);
+      ++discarded;
+    } else {
+      ++it;
+    }
+  }
+
+  // Epochs and generations only move forward, so an oversubscription authority
+  // bound to a superseded one can never be live again.
+  for (auto it = oversubscriptions_.begin(); it != oversubscriptions_.end();) {
+    const OversubscriptionAuthority& authority = it->second;
+    const auto path_it = paths_.find(authority.path.raw());
+    const bool current = path_it != paths_.end() && authority.epoch.value == config_.epoch.value &&
+                         authority.policy_generation == config_.policy.generation &&
+                         authority.path_generation == path_it->second.generation &&
+                         authority.capacity_generation == path_it->second.capacity_generation;
+    if (!current) {
+      it = oversubscriptions_.erase(it);
+      ++discarded;
+    } else {
+      ++it;
+    }
+  }
+
+  // Ended grants, oldest first. The order is a function of the records alone.
+  struct Ended {
+    std::uint64_t updated_at_ms;
+    std::uint64_t arbitration;
+    Id128 key;
+  };
+  std::vector<Ended> ended;
+  for (const auto& entry : grants_) {
+    if (is_terminal(entry.second.state)) {
+      ended.push_back(Ended{entry.second.updated_at_ms, entry.second.arbitration.value, entry.first});
+    }
+  }
+  if (ended.size() > retain_ended_grants) {
+    std::sort(ended.begin(), ended.end(), [](const Ended& a, const Ended& b) {
+      if (a.updated_at_ms != b.updated_at_ms) {
+        return a.updated_at_ms < b.updated_at_ms;
+      }
+      if (a.arbitration != b.arbitration) {
+        return a.arbitration < b.arbitration;
+      }
+      return a.key < b.key;
+    });
+    const std::size_t surplus = ended.size() - retain_ended_grants;
+    for (std::size_t i = 0; i < surplus; ++i) {
+      const auto grant_it = grants_.find(ended[i].key);
+      if (grant_it == grants_.end()) {
+        continue;
+      }
+      const auto request_it = request_index_.find(grant_it->second.request.raw());
+      if (request_it != request_index_.end() && request_it->second == ended[i].key) {
+        request_index_.erase(request_it);
+      }
+      grants_.erase(grant_it);
+      ++discarded;
+    }
+  }
+
+  for (auto it = verifications_.begin(); it != verifications_.end();) {
+    if (grants_.find(it->second.grant.raw()) == grants_.end()) {
+      it = verifications_.erase(it);
+      ++discarded;
+    } else {
+      ++it;
+    }
+  }
+  return discarded;
 }
 
 // ---------------------------------------------------------------------------
